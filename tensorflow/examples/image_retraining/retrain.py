@@ -118,6 +118,8 @@ tf.app.flags.DEFINE_string(
 tf.app.flags.DEFINE_string('final_tensor_name', 'final_result',
                            """The name of the output classification layer in"""
                            """ the retrained graph.""")
+tf.app.flags.DEFINE_string('summaries_dir', '/tmp/summaries',
+                           """Path to summaries storage.""")
 
 # Controls the distortions used during training.
 tf.app.flags.DEFINE_boolean(
@@ -357,6 +359,12 @@ def ensure_dir_exists(dir_name):
   """
   if not os.path.exists(dir_name):
     os.makedirs(dir_name)
+
+
+def init_summaries(summaries_dir):
+   if tf.gfile.Exists(summaries_dir):
+    tf.gfile.DeleteRecursively(summaries_dir)
+   tf.gfile.MakeDirs(summaries_dir)
 
 
 def get_or_create_bottleneck(sess, image_lists, label_name, index, image_dir,
@@ -683,11 +691,16 @@ def add_final_training_ops(class_count, final_tensor_name, bottleneck_tensor):
   ground_truth_input = tf.placeholder(tf.float32,
                                       [None, class_count],
                                       name='GroundTruthInput')
-  cross_entropy = tf.nn.softmax_cross_entropy_with_logits(
-      logits, ground_truth_input)
-  cross_entropy_mean = tf.reduce_mean(cross_entropy)
-  train_step = tf.train.GradientDescentOptimizer(FLAGS.learning_rate).minimize(
-      cross_entropy_mean)
+  with tf.name_scope('cross_entropy'):
+    with tf.name_scope('total'):
+      cross_entropy = tf.nn.softmax_cross_entropy_with_logits(
+          logits, ground_truth_input)
+    with tf.name_scope('normalized'):
+      cross_entropy_mean = tf.reduce_mean(cross_entropy)
+    tf.scalar_summary('cross entropy', cross_entropy_mean)
+  with tf.name_scope('train'):
+    train_step = tf.train.GradientDescentOptimizer(FLAGS.learning_rate).minimize(
+        cross_entropy_mean)
   return (train_step, cross_entropy_mean, bottleneck_input, ground_truth_input,
           final_tensor)
 
@@ -703,13 +716,19 @@ def add_evaluation_step(result_tensor, ground_truth_tensor):
   Returns:
     Nothing.
   """
-  correct_prediction = tf.equal(
-      tf.argmax(result_tensor, 1), tf.argmax(ground_truth_tensor, 1))
-  evaluation_step = tf.reduce_mean(tf.cast(correct_prediction, 'float'))
+  with tf.name_scope('accuracy'):
+    with tf.name_scope('correct_prediction'):
+      correct_prediction = tf.equal(
+          tf.argmax(result_tensor, 1), tf.argmax(ground_truth_tensor, 1))
+    with tf.name_scope('accuracy'):
+      evaluation_step = tf.reduce_mean(tf.cast(correct_prediction, 'float'))
+    tf.scalar_summary('accuracy', evaluation_step)
   return evaluation_step
 
 
 def main(_):
+  init_summaries(FLAGS.summaries_dir)
+
   # Set up the pre-trained graph.
   maybe_download_and_extract()
   graph, bottleneck_tensor, jpeg_data_tensor, resized_image_tensor = (
@@ -750,6 +769,10 @@ def main(_):
                                           FLAGS.final_tensor_name,
                                           bottleneck_tensor)
 
+  merged = tf.merge_all_summaries()
+  train_writer = tf.train.SummaryWriter(FLAGS.summaries_dir + '/train', sess.graph)
+  test_writer = tf.train.SummaryWriter(FLAGS.summaries_dir + '/test')
+
   # Set up all our weights to their initial default values.
   init = tf.initialize_all_variables()
   sess.run(init)
@@ -779,10 +802,11 @@ def main(_):
     # Every so often, print out how well the graph is training.
     is_last_step = (i + 1 == FLAGS.how_many_training_steps)
     if (i % FLAGS.eval_step_interval) == 0 or is_last_step:
-      train_accuracy, cross_entropy_value = sess.run(
-          [evaluation_step, cross_entropy],
+      train_summary, train_accuracy, cross_entropy_value = sess.run(
+          [merged, evaluation_step, cross_entropy],
           feed_dict={bottleneck_input: train_bottlenecks,
                      ground_truth_input: train_ground_truth})
+      train_writer.add_summary(train_summary, i)
       print('%s: Step %d: Train accuracy = %.1f%%' % (datetime.now(), i,
                                                       train_accuracy * 100))
       print('%s: Step %d: Cross entropy = %f' % (datetime.now(), i,
@@ -792,10 +816,11 @@ def main(_):
               sess, image_lists, FLAGS.validation_batch_size, 'validation',
               FLAGS.bottleneck_dir, FLAGS.image_dir, jpeg_data_tensor,
               bottleneck_tensor))
-      validation_accuracy = sess.run(
-          evaluation_step,
+      validation_summary, validation_accuracy = sess.run(
+          [merged, evaluation_step],
           feed_dict={bottleneck_input: validation_bottlenecks,
                      ground_truth_input: validation_ground_truth})
+      test_writer.add_summary(validation_summary, i)
       print('%s: Step %d: Validation accuracy = %.1f%%' %
             (datetime.now(), i, validation_accuracy * 100))
 
